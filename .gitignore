@@ -1,0 +1,11 @@
+.pio/
+.vscode/
+Lib/
+Scripts/
+__pycache__/
+*.py[cod]
+*.log
+*.err
+/fixmain.py
+.DS_Store
+Thumbs.db
