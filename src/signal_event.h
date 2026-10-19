@@ -19,4 +19,7 @@ struct SignalEvent {
     SrcType type;
     uint16_t companyId;
     uint32_t tMs;
+    // True for events produced by the local traffic generator, so the UI can
+    // mark the device's own transmissions instead of ambient sources.
+    bool isLocal;
 };

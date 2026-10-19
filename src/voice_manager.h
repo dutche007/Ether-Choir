@@ -22,3 +22,8 @@ struct VoiceCommand {
 };
 
 bool voiceManagerMapEvent(const SignalEvent& event, VoiceCommand& command);
+
+// The note a source sounds, for example "C4". Both the degree and the octave
+// come from the transmitter hash, so a device keeps the same part for as long
+// as it is in the choir.
+const char* voiceManagerNoteName(uint32_t idHash);

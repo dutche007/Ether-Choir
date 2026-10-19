@@ -16,7 +16,8 @@ frame payloads are not stored or displayed.
 - A fixed-pool audio renderer with keyboard input and a limiter.
 - Constellation and waterfall-style display views, plus status/settings screens.
 - Reverb, microphone input, IMU controls and SD recording are not currently
-  enabled in this prototype.
+  enabled in this prototype. Reverb/echo, preset save/load and the SD recorder
+  are deliberately out of scope for this build.
 
 This is a work in progress, not a finished or certified device. Radio results
 vary with the environment and firmware; use it only where passive reception is
@@ -44,5 +45,6 @@ pio device monitor -b 115200 -e cardputer-adv
 - `Space`: toggle the test tone.
 - `w` / `b` / `e`: Wi-Fi only / BLE only / both.
 - `;`: cycle display screens.
+- `1`-`5`: toggle source families (pad, pluck, shimmer, bell, accent).
 
 The keyboard is scanned through the M5Cardputer library abstraction.

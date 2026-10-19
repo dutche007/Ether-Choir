@@ -6,6 +6,7 @@
 #include "radio.h"
 
 #include "config.h"
+#include "radio_traffic.h"
 
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
@@ -20,6 +21,7 @@ bool wifiRadioBegin();
 void wifiSliceStart();
 void wifiSliceStop();
 void wifiNextChannel();
+uint8_t wifiCurrentChannel();
 bool bleRadioBegin();
 void bleSliceStart();
 void bleSliceStop();
@@ -38,6 +40,12 @@ std::atomic<uint32_t> g_queueDropCount{0};
 uint32_t g_salt = 0;
 
 std::atomic<RadioMode> g_mode{RadioMode::Both};
+
+// Runtime radio timing, adjustable from the settings screen.
+std::atomic<uint32_t> g_wifiSliceMs{config::kWifiSliceMs};
+std::atomic<uint32_t> g_bleSliceMs{config::kBleSliceMs};
+std::atomic<uint32_t> g_channelDwellMs{config::kChannelDwellMs};
+std::atomic<bool> g_trafficEnabled{false};
 
 // Scheduler task handle and state.
 TaskHandle_t g_schedulerTask = nullptr;
@@ -60,68 +68,106 @@ void radioSchedulerTask(void*) {
     uint32_t lastHopMs = millis();
     bool wifiActive = false;
     bool bleActive = false;
+    uint8_t channelsSwept = 0;
     for (;;) {
         const RadioMode mode = g_mode.load(std::memory_order_relaxed);
         const uint32_t now = millis();
         const uint32_t sliceElapsed = now - lastSliceMs;
         const uint32_t hopElapsed = now - lastHopMs;
+        const uint32_t wifiSliceMs = g_wifiSliceMs.load(std::memory_order_relaxed);
+        const uint32_t bleSliceMs = g_bleSliceMs.load(std::memory_order_relaxed);
+        const uint32_t dwellMs = g_channelDwellMs.load(std::memory_order_relaxed);
+        const bool traffic = g_trafficEnabled.load(std::memory_order_relaxed);
 
         const bool wantWifi = (mode == RadioMode::WifiOnly) || (mode == RadioMode::Both);
         const bool wantBle = (mode == RadioMode::BleOnly) || (mode == RadioMode::Both);
 
-        // Channel hop within the Wi-Fi slice (150 ms dwell), independent of the
-        // Wi-Fi/BLE slice boundary.
-        if (wifiActive && hopElapsed >= config::kChannelDwellMs) {
-            wifiNextChannel();
-            lastHopMs = now;
-        }
-
-        // Decide which radio owns the slice. In Both mode the radios alternate;
-        // in a single-radio mode only that radio runs.
-        const bool wifiTurn = wantWifi && (!wantBle || (sliceElapsed >= config::kWifiSliceMs && wifiActive));
-
-        if (wifiTurn && !wifiActive) {
+        // The local traffic generator needs the radio to stay on its own
+        // channel, so the band sweep and the BLE slices are paused while it
+        // runs.
+        if (traffic) {
             if (bleActive) {
                 bleSliceStop();
                 bleActive = false;
             }
-            wifiSliceStart();
-            wifiActive = true;
-            lastSliceMs = now;
-            lastHopMs = now;
+            if (!wifiActive) {
+                wifiSliceStart();
+                wifiActive = true;
+                lastSliceMs = now;
+                lastHopMs = now;
+                channelsSwept = 0;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        if (!wifiTurn && wantBle && !bleActive) {
+
+        // Hop to the next channel within the Wi-Fi slice.
+        if (wifiActive && hopElapsed >= dwellMs) {
+            wifiNextChannel();
+            lastHopMs = now;
+            if (channelsSwept < config::kWifiChannelCount) {
+                ++channelsSwept;
+            }
+        }
+
+        // Decide which radio owns the slice. In Both mode the radios alternate;
+        // in a single-radio mode only that radio runs.
+        if (wantWifi && !wantBle) {
+            // Wi-Fi only: hold the radio for the whole cycle, hopping channels.
+            if (bleActive) {
+                bleSliceStop();
+                bleActive = false;
+            }
+            if (!wifiActive) {
+                wifiSliceStart();
+                wifiActive = true;
+                lastSliceMs = now;
+                lastHopMs = now;
+                channelsSwept = 0;
+            }
+        } else if (wantBle && !wantWifi) {
+            // BLE only: hold the radio for the whole cycle.
             if (wifiActive) {
                 wifiSliceStop();
                 wifiActive = false;
             }
-            bleSliceStart();
-            bleActive = true;
-            lastSliceMs = now;
-            lastHopMs = now;
-            continue;
-        }
-
-        // Hold the current slice until its dwell elapses, then yield to the
-        // other radio (Both mode) or keep running (single-radio mode).
-        if (wifiActive && sliceElapsed >= config::kWifiSliceMs) {
-            if (wantBle) {
+            if (!bleActive) {
+                bleSliceStart();
+                bleActive = true;
+                lastSliceMs = now;
+            }
+        } else if (wifiActive) {
+            // Both mode: hold the Wi-Fi slice until it elapses or the whole
+            // band has been swept, then hand the radio over to BLE.
+            if (sliceElapsed >= wifiSliceMs
+                || channelsSwept >= config::kWifiChannelCount) {
                 wifiSliceStop();
                 wifiActive = false;
+                bleSliceStart();
+                bleActive = true;
                 lastSliceMs = now;
-                continue;
+                lastHopMs = now;
+                channelsSwept = 0;
             }
-            lastSliceMs = now;
-        }
-        if (bleActive && sliceElapsed >= config::kBleSliceMs) {
-            if (wantWifi) {
+        } else if (bleActive) {
+            // Both mode: hold the BLE slice until it elapses, then hand the
+            // radio back to Wi-Fi.
+            if (sliceElapsed >= bleSliceMs) {
                 bleSliceStop();
                 bleActive = false;
+                wifiSliceStart();
+                wifiActive = true;
                 lastSliceMs = now;
-                continue;
+                lastHopMs = now;
+                channelsSwept = 0;
             }
+        } else {
+            // Both mode with neither radio running: start the Wi-Fi slice.
+            wifiSliceStart();
+            wifiActive = true;
             lastSliceMs = now;
+            lastHopMs = now;
+            channelsSwept = 0;
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -173,4 +219,57 @@ void radioPushEvent(const SignalEvent& event) {
     if (g_eventQueue == nullptr || xQueueSend(g_eventQueue, &event, 0) != pdTRUE) {
         g_queueDropCount.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+uint8_t radioGetCurrentChannel() {
+    return wifiCurrentChannel();
+}
+
+void radioSetWifiSliceMs(uint32_t milliseconds) {
+    g_wifiSliceMs.store(milliseconds, std::memory_order_relaxed);
+}
+
+uint32_t radioGetWifiSliceMs() {
+    return g_wifiSliceMs.load(std::memory_order_relaxed);
+}
+
+void radioSetBleSliceMs(uint32_t milliseconds) {
+    g_bleSliceMs.store(milliseconds, std::memory_order_relaxed);
+}
+
+uint32_t radioGetBleSliceMs() {
+    return g_bleSliceMs.load(std::memory_order_relaxed);
+}
+
+void radioSetChannelDwellMs(uint32_t milliseconds) {
+    g_channelDwellMs.store(milliseconds, std::memory_order_relaxed);
+}
+
+uint32_t radioGetChannelDwellMs() {
+    return g_channelDwellMs.load(std::memory_order_relaxed);
+}
+
+void radioSetTrafficEnabled(bool enabled) {
+    const bool wasEnabled = g_trafficEnabled.load(std::memory_order_relaxed);
+    if (wasEnabled == enabled) {
+        return;
+    }
+    g_trafficEnabled.store(enabled, std::memory_order_relaxed);
+    if (enabled) {
+        trafficBegin();
+    } else {
+        trafficStop();
+    }
+}
+
+bool radioGetTrafficEnabled() {
+    return g_trafficEnabled.load(std::memory_order_relaxed);
+}
+
+uint32_t radioGetTrafficPacketCount() {
+    return trafficPacketCount();
+}
+
+bool radioTrafficActive() {
+    return g_trafficEnabled.load(std::memory_order_relaxed);
 }

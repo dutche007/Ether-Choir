@@ -16,7 +16,7 @@ constexpr size_t kBlockCount = 3;
 constexpr size_t kSineTableSize = 1024;
 constexpr size_t kVoicePoolSize = 12;
 constexpr size_t kRadioVoiceCount = kVoicePoolSize - 1;
-constexpr size_t kVoiceQueueCapacity = 32;
+constexpr size_t kVoiceQueueCapacity = 64;
 constexpr size_t kStealTailCount = 2;
 constexpr uint16_t kStealFadeSamples = 128;
 constexpr uint8_t kSpeakerChannel = 0;
@@ -24,6 +24,10 @@ constexpr uint32_t kEnvelopeMaximum = 0x00FFFFFF;
 constexpr uint32_t kFastAttackStep = 12000;
 constexpr uint32_t kPadAttackStep = 900;
 constexpr uint32_t kPadReleaseStep = 160;
+// The keyboard voice is gated by the key, so the release has to be quick.
+// At 22050 Hz this fades the note out in about 12 ms, which is short enough
+// that a released key sounds stopped instead of hanging on.
+constexpr uint32_t kKeyboardReleaseStep = 65536;
 constexpr int32_t kLimiterKnee = 12000;
 constexpr int32_t kLimiterMaximum = 16000;
 constexpr uint32_t kMaximumPhaseDeviation = 1u << 30;
@@ -43,6 +47,15 @@ struct AudioBlock {
     int16_t samples[kBlockSamples]{};
     std::atomic<BufferState> state{BufferState::Free};
 };
+
+// Lock-free waveform tap for the oscilloscope screen. The renderer writes
+// decimated output samples into a ring; the UI copies the most recent points
+// out of it without locking the audio task.
+constexpr uint16_t kWaveformRingSize = 256;
+constexpr uint8_t kWaveformDecimation = 16;   // 256 block samples -> 16 points
+int16_t g_waveformRing[kWaveformRingSize]{};
+std::atomic<uint32_t> g_waveformWriteIndex{0};
+std::atomic<uint16_t> g_waveformPeak{0};
 
 struct Voice {
     uint32_t idHash = 0;
@@ -301,7 +314,12 @@ void updateKeyboardVoice() {
     if (!voice.active) {
         startVoice(voice, command);
     } else {
-        if (voice.stage == EnvelopeStage::Release) voice.stage = EnvelopeStage::Attack;
+        if (voice.stage == EnvelopeStage::Release) {
+            // A key that was let go and pressed again starts from silence, so
+            // the note retriggers cleanly instead of jumping back in.
+            voice.stage = EnvelopeStage::Attack;
+            voice.envelopeQ24 = 0;
+        }
         voice.targetPhaseIncrement = static_cast<int32_t>(phaseIncrementFor(command.frequencyMilliHz));
         voice.targetDetunedPhaseIncrement = voice.targetPhaseIncrement;
         voice.targetGainQ15 = command.gainQ15;
@@ -354,7 +372,7 @@ int32_t renderVoiceSample(Voice& voice) {
         }
         case EnvelopeStage::Release: {
             const uint32_t releaseStep = voice.family == VoiceFamily::Pad ? kPadReleaseStep
-                : voice.family == VoiceFamily::Keyboard ? 2048 : 1024;
+                : voice.family == VoiceFamily::Keyboard ? kKeyboardReleaseStep : 1024;
             voice.envelopeQ24 = voice.envelopeQ24 > releaseStep ? voice.envelopeQ24 - releaseStep : 0;
             break;
         }
@@ -399,6 +417,7 @@ void renderBlock(int16_t* samples) {
     }
     const uint16_t mixGainQ15 = kVoiceMixGainQ15[activeVoiceCount];
 
+    uint16_t peak = 0;
     for (size_t index = 0; index < kBlockSamples; ++index) {
         int32_t mix = 0;
         for (Voice& voice : g_voices) mix += renderVoiceSample(voice);
@@ -413,8 +432,21 @@ void renderBlock(int16_t* samples) {
         // Master chain: limiter -> reverb -> DC blocker.
         const int16_t limited = limitSample(scaledMix);
         // (reverb bypassed: dry only).
-        samples[index] = dcBlocker(limited);  // Reverb bypassed.
+        const int16_t out = dcBlocker(limited);
+        samples[index] = out;  // Reverb bypassed.
+
+        // Tap the output for the oscilloscope screen.
+        if (index % kWaveformDecimation == 0) {
+            const uint32_t slot = g_waveformWriteIndex.load(std::memory_order_relaxed);
+            g_waveformRing[slot % kWaveformRingSize] = out;
+            g_waveformWriteIndex.store(slot + 1, std::memory_order_relaxed);
+            const uint16_t magnitude = static_cast<uint16_t>(out < 0 ? -out : out);
+            if (magnitude > peak) {
+                peak = magnitude;
+            }
+        }
     }
+    g_waveformPeak.store(peak, std::memory_order_relaxed);
 }
 
 AudioBlock* blockForData(const void* data) {
@@ -514,10 +546,33 @@ void audioEngineSetReverbWet(uint16_t wetQ15) {
 
 uint64_t audioEngineGetRenderTimeUs() {
     return g_renderTimeUs.load(std::memory_order_relaxed);
+}
 
 uint32_t audioEngineActiveVoiceCount() {
     uint32_t count = 0;
     for (const Voice& voice : g_voices) count += voice.active ? 1 : 0;
     return count;
 }
+
+uint32_t audioEngineVoiceCapacity() {
+    return kRadioVoiceCount;
+}
+
+uint16_t audioEngineCopyWaveform(int16_t* destination, uint8_t pointCount) {
+    if (destination == nullptr || pointCount == 0) {
+        return 0;
+    }
+    const uint32_t writeIndex = g_waveformWriteIndex.load(std::memory_order_acquire);
+    const uint16_t available = writeIndex < pointCount
+        ? static_cast<uint16_t>(writeIndex)
+        : pointCount;
+    for (uint16_t i = 0; i < available; ++i) {
+        const uint32_t slot = writeIndex - 1 - i;
+        destination[available - 1 - i] = g_waveformRing[slot % kWaveformRingSize];
+    }
+    return available;
+}
+
+uint16_t audioEngineGetPeakLevel() {
+    return g_waveformPeak.load(std::memory_order_relaxed);
 }

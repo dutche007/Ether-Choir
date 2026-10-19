@@ -75,8 +75,20 @@ bool wifiRadioBegin() {
 }
 
 void wifiSliceStart() {
-    esp_wifi_set_channel(g_currentChannel, WIFI_SECOND_CHAN_NONE);
+    // While the local traffic generator runs, the radio stays on the access
+    // point's channel so the channel is not changed underneath it.
+    if (!radioTrafficActive()) {
+        esp_wifi_set_channel(g_currentChannel, WIFI_SECOND_CHAN_NONE);
+    }
     esp_wifi_set_promiscuous(true);
+}
+
+void wifiSetChannel(uint8_t channel) {
+    if (channel < config::kFirstWifiChannel || channel > config::kLastWifiChannel) {
+        return;
+    }
+    g_currentChannel = channel;
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 }
 
 void wifiSliceStop() {
@@ -88,4 +100,12 @@ void wifiNextChannel() {
         ? config::kFirstWifiChannel
         : static_cast<uint8_t>(g_currentChannel + 1);
     esp_wifi_set_channel(g_currentChannel, WIFI_SECOND_CHAN_NONE);
+}
+
+uint8_t wifiCurrentChannel() {
+    return g_currentChannel;
+}
+
+void wifiSetPromiscuous(bool enabled) {
+    esp_wifi_set_promiscuous(enabled);
 }

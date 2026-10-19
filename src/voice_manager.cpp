@@ -10,10 +10,26 @@ constexpr uint32_t kMinorPentatonicMilliHz[3][5] = {
     {261626, 311127, 349228, 391995, 466164},
     {523251, 622254, 698456, 783991, 932328}
 };
+constexpr const char* kMinorPentatonicNames[3][5] = {
+    {"C3", "Eb3", "F3", "G3", "Bb3"},
+    {"C4", "Eb4", "F4", "G4", "Bb4"},
+    {"C5", "Eb5", "F5", "G5", "Bb5"},
+};
 constexpr int8_t kMinimumRssi = -95;
 constexpr int8_t kMaximumRssi = -30;
 constexpr uint16_t kMinimumGainQ15 = 5000;
 constexpr uint16_t kMaximumGainQ15 = 27000;
+
+// The part a source holds: which degree of the scale, and in which octave.
+// Both come from the transmitter hash, so a device keeps the same note for as
+// long as it stays in the choir.
+uint8_t noteDegree(uint32_t idHash) {
+    return static_cast<uint8_t>(idHash % 5);
+}
+
+uint8_t noteOctave(uint32_t idHash) {
+    return static_cast<uint8_t>((idHash >> 8) % 3);
+}
 
 uint16_t baseFmIndex(SrcType type) {
     switch (type) {
@@ -49,10 +65,8 @@ bool voiceManagerMapEvent(const SignalEvent& event, VoiceCommand& command) {
         rssi = kMaximumRssi;
     }
     const uint16_t strength = static_cast<uint16_t>(rssi - kMinimumRssi);
-    const uint8_t degree = event.idHash % 5;
-    const uint8_t octave = event.channel >= 1 && event.channel <= 13
-        ? (event.channel - 1) / 5
-        : (event.idHash >> 8) % 3;
+    const uint8_t degree = noteDegree(event.idHash);
+    const uint8_t octave = noteOctave(event.idHash);
 
     command.idHash = event.idHash;
     command.family = familyFor(event.type);
@@ -63,4 +77,8 @@ bool voiceManagerMapEvent(const SignalEvent& event, VoiceCommand& command) {
     command.fmIndexQ15 = baseFmIndex(event.type)
         + (static_cast<uint32_t>(strength) * 70) / (kMaximumRssi - kMinimumRssi);
     return true;
+}
+
+const char* voiceManagerNoteName(uint32_t idHash) {
+    return kMinorPentatonicNames[noteOctave(idHash)][noteDegree(idHash)];
 }
